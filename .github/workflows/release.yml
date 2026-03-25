@@ -18,7 +18,7 @@ permissions:
 jobs:
   build-musl:
     name: Build ${{ matrix.label }} musl binary
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
@@ -26,9 +26,15 @@ jobs:
           - target: x86_64-unknown-linux-musl
             artifact_dir: amd64
             label: x86_64
+            runs_on: ubuntu-latest
+            linker: x86_64-linux-musl-gcc
+            target_env: X86_64_UNKNOWN_LINUX_MUSL
           - target: aarch64-unknown-linux-musl
             artifact_dir: arm64
             label: arm64
+            runs_on: ubuntu-24.04-arm
+            linker: aarch64-linux-musl-gcc
+            target_env: AARCH64_UNKNOWN_LINUX_MUSL
 
     steps:
       - name: Checkout
@@ -36,14 +42,21 @@ jobs:
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Install zig and cargo-zigbuild
-        uses: taiki-e/install-action@v2
         with:
-          tool: zig,cargo-zigbuild
+          targets: ${{ matrix.target }}
+
+      - name: Install native musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config
+
+      - name: Configure Rust musl linker
+        run: |
+          echo "CC_${{ matrix.target_env }}=${{ matrix.linker }}" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${{ matrix.target_env }}_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
 
       - name: Build release binary
-        run: cargo zigbuild --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Prepare artifact
         run: |
