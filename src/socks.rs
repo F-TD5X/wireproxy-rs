@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -154,7 +154,7 @@ impl SocksServer {
             }
         };
 
-        let reply_addr = SocketAddr::V4(SocketAddrV4::new(reply_ip(local_addr)?, 0));
+        let reply_addr = SocketAddr::new(local_addr.ip(), 0);
         let stream = proto.reply_success(reply_addr).await?;
         let (mut client_reader, mut client_writer) = tokio::io::split(stream);
         let uploaded_bytes = Arc::new(AtomicU64::new(0));
@@ -213,9 +213,8 @@ impl SocksServer {
         local_addr: SocketAddr,
         client_addr: SocketAddr,
     ) -> Result<()> {
-        let bind_ip = reply_ip(local_addr)?;
         let client_udp = Arc::new(
-            UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(bind_ip, 0)))
+            UdpSocket::bind(SocketAddr::new(local_addr.ip(), 0))
                 .await
                 .context("failed to bind local SOCKS UDP relay socket")?,
         );
@@ -319,8 +318,7 @@ impl SocksServer {
                         continue;
                     };
 
-                    let mut packet =
-                        new_udp_header(SocketAddr::V4(from)).map_err(anyhow::Error::new)?;
+                    let mut packet = new_udp_header(from).map_err(anyhow::Error::new)?;
                     packet.extend_from_slice(&buffer[..size]);
                     tracing::debug!(
                         client = %client_addr,
@@ -382,29 +380,20 @@ async fn resolve_target_with(
     target: TargetAddr,
 ) -> std::result::Result<SocketAddr, ReplyError> {
     match target {
-        TargetAddr::Ip(addr @ SocketAddr::V4(_)) => Ok(addr),
-        TargetAddr::Ip(SocketAddr::V6(_)) => Err(ReplyError::AddressTypeNotSupported),
+        TargetAddr::Ip(addr) => Ok(addr),
         TargetAddr::Domain(domain, port) => {
             let ip = resolver
-                .resolve_ipv4(&domain)
+                .resolve_ip(&domain)
                 .await
                 .map_err(|_| ReplyError::HostUnreachable)?;
             tracing::debug!(domain = %domain, resolved_ip = %ip, port, "resolved SOCKS target domain");
-            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+            Ok(SocketAddr::new(ip, port))
         }
-    }
-}
-
-fn reply_ip(local_addr: SocketAddr) -> std::result::Result<Ipv4Addr, ReplyError> {
-    match local_addr.ip() {
-        IpAddr::V4(ip) => Ok(ip),
-        IpAddr::V6(_) => Err(ReplyError::AddressTypeNotSupported),
     }
 }
 
 fn map_netstack_error(error: &NetstackError) -> ReplyError {
     match error {
-        NetstackError::Ipv6NotSupported => ReplyError::AddressTypeNotSupported,
         NetstackError::TcpConnect(_)
         | NetstackError::TcpConnectTimeout
         | NetstackError::UdpSendTimeout => ReplyError::HostUnreachable,

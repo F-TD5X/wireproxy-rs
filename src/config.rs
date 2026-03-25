@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -6,13 +6,19 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ini::{Ini, Properties};
 use tokio::net::lookup_host;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TunnelAddresses {
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+}
+
 #[derive(Debug, Clone)]
 pub struct WgConfigFile {
     pub private_key: [u8; 32],
     pub peer_public_key: [u8; 32],
     pub preshared_key: Option<[u8; 32]>,
-    pub tunnel_ip: Ipv4Addr,
-    pub dns_server: Option<Ipv4Addr>,
+    pub tunnel_addrs: TunnelAddresses,
+    pub dns_server: Option<IpAddr>,
     pub mtu: u16,
     pub listen_port: Option<u16>,
     pub endpoint_host: String,
@@ -26,11 +32,11 @@ pub struct TunnelConfig {
     pub private_key: [u8; 32],
     pub peer_public_key: [u8; 32],
     pub preshared_key: Option<[u8; 32]>,
-    pub tunnel_ip: Ipv4Addr,
-    pub dns_server: Option<Ipv4Addr>,
+    pub tunnel_addrs: TunnelAddresses,
+    pub dns_server: Option<IpAddr>,
     pub mtu: u16,
     pub listen_port: Option<u16>,
-    pub peer_endpoint: SocketAddrV4,
+    pub peer_endpoint: SocketAddr,
     pub persistent_keepalive: Option<u16>,
     pub reserved_bytes: [u8; 3],
 }
@@ -55,9 +61,9 @@ impl WgConfigFile {
             .map(|value| decode_key(value, "PresharedKey"))
             .transpose()?;
 
-        let tunnel_ip = parse_first_ipv4(required(interface, "Address")?, "Address")?;
+        let tunnel_addrs = parse_tunnel_addresses(required(interface, "Address")?, "Address")?;
         let dns_server = optional(interface, "DNS")
-            .map(|value| parse_first_ipv4(value, "DNS"))
+            .map(|value| parse_first_ip(value, "DNS"))
             .transpose()?;
         let mtu = optional(interface, "MTU")
             .map(|value| parse_u16(value, "MTU"))
@@ -83,7 +89,7 @@ impl WgConfigFile {
             private_key,
             peer_public_key,
             preshared_key,
-            tunnel_ip,
+            tunnel_addrs,
             dns_server,
             mtu,
             listen_port,
@@ -94,7 +100,8 @@ impl WgConfigFile {
         };
 
         tracing::debug!(
-            tunnel_ip = %parsed.tunnel_ip,
+            tunnel_ipv4 = ?parsed.tunnel_addrs.ipv4,
+            tunnel_ipv6 = ?parsed.tunnel_addrs.ipv6,
             dns = ?parsed.dns_server,
             mtu = parsed.mtu,
             listen_port = ?parsed.listen_port,
@@ -121,7 +128,7 @@ impl WgConfigFile {
             private_key: self.private_key,
             peer_public_key: self.peer_public_key,
             preshared_key: self.preshared_key,
-            tunnel_ip: self.tunnel_ip,
+            tunnel_addrs: self.tunnel_addrs,
             dns_server: self.dns_server,
             mtu: self.mtu,
             listen_port: self.listen_port,
@@ -131,7 +138,8 @@ impl WgConfigFile {
         };
 
         tracing::info!(
-            tunnel_ip = %resolved.tunnel_ip,
+            tunnel_ipv4 = ?resolved.tunnel_addrs.ipv4,
+            tunnel_ipv6 = ?resolved.tunnel_addrs.ipv6,
             endpoint = %resolved.peer_endpoint,
             mtu = resolved.mtu,
             dns = ?resolved.dns_server,
@@ -176,14 +184,38 @@ fn decode_key(value: &str, key_name: &str) -> Result<[u8; 32]> {
         .map_err(|v: Vec<u8>| anyhow!("{} must decode to 32 bytes, got {}", key_name, v.len()))
 }
 
-fn parse_first_ipv4(value: &str, key_name: &str) -> Result<Ipv4Addr> {
+fn parse_tunnel_addresses(value: &str, key_name: &str) -> Result<TunnelAddresses> {
+    let mut addrs = TunnelAddresses::default();
+
+    for entry in value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| entry.split('/').next())
+    {
+        match entry.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) if addrs.ipv4.is_none() => addrs.ipv4 = Some(ip),
+            Ok(IpAddr::V6(ip)) if addrs.ipv6.is_none() => addrs.ipv6 = Some(ip),
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+
+    if addrs.ipv4.is_none() && addrs.ipv6.is_none() {
+        bail!("{} does not contain an IP address", key_name);
+    }
+
+    Ok(addrs)
+}
+
+fn parse_first_ip(value: &str, key_name: &str) -> Result<IpAddr> {
     value
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .filter_map(|entry| entry.split('/').next())
-        .find_map(|entry| entry.parse::<Ipv4Addr>().ok())
-        .ok_or_else(|| anyhow!("{} does not contain an IPv4 address", key_name))
+        .find_map(|entry| entry.parse::<IpAddr>().ok())
+        .ok_or_else(|| anyhow!("{} does not contain an IP address", key_name))
 }
 
 fn parse_u16(value: &str, key_name: &str) -> Result<u16> {
@@ -231,26 +263,23 @@ fn parse_reserved_bytes(value: &str) -> Result<[u8; 3]> {
     Ok(reserved)
 }
 
-async fn resolve_endpoint(host: &str, port: u16) -> Result<SocketAddrV4> {
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+async fn resolve_endpoint(host: &str, port: u16) -> Result<SocketAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
         tracing::debug!(
             host = %host,
             port,
-            endpoint = %SocketAddrV4::new(ip, port),
-            "WireGuard endpoint already an IPv4 address"
+            endpoint = %SocketAddr::new(ip, port),
+            "WireGuard endpoint already an IP address"
         );
-        return Ok(SocketAddrV4::new(ip, port));
+        return Ok(SocketAddr::new(ip, port));
     }
 
     let mut addrs = lookup_host((host, port))
         .await
         .with_context(|| format!("failed to resolve endpoint {}", host))?;
     let endpoint = addrs
-        .find_map(|addr| match addr {
-            SocketAddr::V4(v4) => Some(v4),
-            SocketAddr::V6(_) => None,
-        })
-        .ok_or_else(|| anyhow!("endpoint {} did not resolve to an IPv4 address", host))?;
+        .next()
+        .ok_or_else(|| anyhow!("endpoint {} did not resolve to an IP address", host))?;
     tracing::debug!(host = %host, port, endpoint = %endpoint, "resolved WireGuard endpoint hostname");
     Ok(endpoint)
 }
@@ -278,7 +307,11 @@ Reserved = 1,2,3
     #[test]
     fn parses_single_peer_config() {
         let config = WgConfigFile::parse(SAMPLE_CONFIG).unwrap();
-        assert_eq!(config.tunnel_ip.to_string(), "172.16.0.2");
+        assert_eq!(config.tunnel_addrs.ipv4.unwrap().to_string(), "172.16.0.2");
+        assert_eq!(
+            config.tunnel_addrs.ipv6.unwrap().to_string(),
+            "2606:4700:110:8c00::2"
+        );
         assert_eq!(config.dns_server.unwrap().to_string(), "1.1.1.1");
         assert_eq!(config.mtu, 1280);
         assert_eq!(config.listen_port, Some(51820));
@@ -311,5 +344,34 @@ Endpoint = 1.1.1.1:51820
         .unwrap();
 
         assert_eq!(config.reserved_bytes, [0, 0, 0]);
+    }
+
+    #[test]
+    fn parses_ipv6_only_interface_config() {
+        let config = WgConfigFile::parse(
+            r#"
+[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 2606:4700:110:8c00::2/128
+DNS = 2606:4700:4700::1111
+
+[Peer]
+PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+Endpoint = [2606:4700:d0::a29f:c001]:51820
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.tunnel_addrs.ipv4, None);
+        assert_eq!(
+            config.tunnel_addrs.ipv6.unwrap().to_string(),
+            "2606:4700:110:8c00::2"
+        );
+        assert_eq!(
+            config.dns_server.unwrap().to_string(),
+            "2606:4700:4700::1111"
+        );
+        assert_eq!(config.endpoint_host, "2606:4700:d0::a29f:c001");
+        assert_eq!(config.endpoint_port, 51820);
     }
 }

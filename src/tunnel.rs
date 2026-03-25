@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::JoinSet;
 use zerocopy::IntoBytes;
 
-use crate::config::TunnelConfig;
+use crate::config::{TunnelAddresses, TunnelConfig};
 use crate::netstack::NetStack;
 
 const CHANNEL_CAPACITY: usize = 256;
@@ -23,8 +23,8 @@ const MAX_UDP_PACKET: usize = 65_535;
 pub struct WireGuardTunnel {
     tunn: Mutex<Tunn>,
     udp_socket: Arc<UdpSocket>,
-    peer_endpoint: SocketAddrV4,
-    tunnel_ip: Ipv4Addr,
+    peer_endpoint: SocketAddr,
+    tunnel_addrs: TunnelAddresses,
     mtu: u16,
     incoming_tx: mpsc::Sender<BytesMut>,
     incoming_rx: Mutex<Option<mpsc::Receiver<BytesMut>>>,
@@ -47,7 +47,16 @@ impl WireGuardTunnel {
             config.reserved_bytes,
         );
 
-        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, config.listen_port.unwrap_or(0));
+        let bind_addr = match config.peer_endpoint {
+            SocketAddr::V4(_) => SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                config.listen_port.unwrap_or(0),
+            ),
+            SocketAddr::V6(_) => SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                config.listen_port.unwrap_or(0),
+            ),
+        };
         let udp_socket = UdpSocket::bind(bind_addr)
             .await
             .with_context(|| format!("failed to bind WireGuard UDP socket on {}", bind_addr))?;
@@ -61,7 +70,8 @@ impl WireGuardTunnel {
         tracing::info!(
             local_addr = %local_addr,
             peer_endpoint = %config.peer_endpoint,
-            tunnel_ip = %config.tunnel_ip,
+            tunnel_ipv4 = ?config.tunnel_addrs.ipv4,
+            tunnel_ipv6 = ?config.tunnel_addrs.ipv6,
             mtu = config.mtu,
             keepalive = ?config.persistent_keepalive,
             reserved = ?config.reserved_bytes,
@@ -72,7 +82,7 @@ impl WireGuardTunnel {
             tunn: Mutex::new(tunn),
             udp_socket: Arc::new(udp_socket),
             peer_endpoint: config.peer_endpoint,
-            tunnel_ip: config.tunnel_ip,
+            tunnel_addrs: config.tunnel_addrs,
             mtu: config.mtu,
             incoming_tx,
             incoming_rx: Mutex::new(Some(incoming_rx)),
@@ -81,8 +91,8 @@ impl WireGuardTunnel {
         }))
     }
 
-    pub fn tunnel_ip(&self) -> Ipv4Addr {
-        self.tunnel_ip
+    pub fn tunnel_addrs(&self) -> TunnelAddresses {
+        self.tunnel_addrs
     }
 
     pub fn mtu(&self) -> u16 {
@@ -215,7 +225,7 @@ impl WireGuardTunnel {
                 .await
                 .context("failed to receive WireGuard UDP packet")?;
 
-            if from != SocketAddr::V4(self.peer_endpoint) {
+            if from != self.peer_endpoint {
                 tracing::debug!("ignoring packet from unexpected peer {from}");
                 continue;
             }
@@ -281,7 +291,8 @@ impl ManagedTunnel {
     pub async fn connect(config: TunnelConfig) -> Result<Self> {
         tracing::info!(
             endpoint = %config.peer_endpoint,
-            tunnel_ip = %config.tunnel_ip,
+            tunnel_ipv4 = ?config.tunnel_addrs.ipv4,
+            tunnel_ipv6 = ?config.tunnel_addrs.ipv6,
             mtu = config.mtu,
             "bringing up managed WireGuard tunnel"
         );

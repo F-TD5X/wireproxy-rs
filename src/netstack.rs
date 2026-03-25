@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +16,9 @@ use smoltcp::socket::udp::{
     UdpMetadata,
 };
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -32,8 +34,6 @@ const NETSTACK_MIN_POLL_SLEEP: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Error)]
 pub enum NetstackError {
-    #[error("IPv6 targets are not supported in v1")]
-    Ipv6NotSupported,
     #[error("TCP connect failed: {0}")]
     TcpConnect(String),
     #[error("TCP connect timed out")]
@@ -148,30 +148,49 @@ struct NetStackInner {
 
 pub struct NetStack {
     inner: Mutex<NetStackInner>,
-    wg_tunnel: Arc<WireGuardTunnel>,
     wg_tx: mpsc::Sender<BytesMut>,
 }
 
 impl NetStack {
     pub fn new(wg_tunnel: Arc<WireGuardTunnel>) -> Arc<Self> {
         let mtu = wg_tunnel.mtu() as usize;
-        let local_ip = wg_tunnel.tunnel_ip();
+        let local_addrs = wg_tunnel.tunnel_addrs();
         let wg_tx = wg_tunnel.outgoing_sender();
 
         let mut device = VirtualDevice::new(mtu);
         let config = Config::new(HardwareAddress::Ip);
         let mut interface = Interface::new(config, &mut device, Instant::now());
         interface.update_ip_addrs(|addrs| {
-            addrs
-                .push(IpCidr::new(IpAddress::Ipv4(local_ip), 32))
-                .expect("failed to add local tunnel address");
+            if let Some(ipv4) = local_addrs.ipv4 {
+                addrs
+                    .push(IpCidr::new(IpAddress::Ipv4(ipv4), 32))
+                    .expect("failed to add local IPv4 tunnel address");
+            }
+            if let Some(ipv6) = local_addrs.ipv6 {
+                addrs
+                    .push(IpCidr::new(IpAddress::Ipv6(ipv6), 128))
+                    .expect("failed to add local IPv6 tunnel address");
+            }
         });
-        interface
-            .routes_mut()
-            .add_default_ipv4_route(Ipv4Address::UNSPECIFIED)
-            .expect("failed to add default route");
+        if local_addrs.ipv4.is_some() {
+            interface
+                .routes_mut()
+                .add_default_ipv4_route(Ipv4Address::UNSPECIFIED)
+                .expect("failed to add default IPv4 route");
+        }
+        if local_addrs.ipv6.is_some() {
+            interface
+                .routes_mut()
+                .add_default_ipv6_route(Ipv6Address::UNSPECIFIED)
+                .expect("failed to add default IPv6 route");
+        }
 
-        tracing::debug!(local_ip = %local_ip, mtu, "initialized userspace netstack");
+        tracing::debug!(
+            tunnel_ipv4 = ?local_addrs.ipv4,
+            tunnel_ipv6 = ?local_addrs.ipv6,
+            mtu,
+            "initialized userspace netstack"
+        );
 
         Arc::new(Self {
             inner: Mutex::new(NetStackInner {
@@ -179,13 +198,8 @@ impl NetStack {
                 device,
                 sockets: SocketSet::new(Vec::new()),
             }),
-            wg_tunnel,
             wg_tx,
         })
-    }
-
-    fn local_ip(&self) -> Ipv4Addr {
-        self.wg_tunnel.tunnel_ip()
     }
 
     pub fn poll(&self) -> bool {
@@ -268,15 +282,12 @@ impl NetStack {
     }
 
     pub fn connect_tcp(&self, handle: SocketHandle, addr: SocketAddr) -> Result<()> {
-        let remote = match addr {
-            SocketAddr::V4(v4) => {
-                smoltcp::wire::IpEndpoint::new(IpAddress::Ipv4(*v4.ip()), v4.port())
-            }
-            SocketAddr::V6(_) => return Err(NetstackError::Ipv6NotSupported),
-        };
-
+        let remote = IpEndpoint::from(addr);
         let local_port = random_ephemeral_port();
-        let local = smoltcp::wire::IpEndpoint::new(IpAddress::Ipv4(self.local_ip()), local_port);
+        let local = IpListenEndpoint {
+            addr: None,
+            port: local_port,
+        };
 
         let mut inner = self.inner.lock();
         let NetStackInner {
@@ -286,7 +297,6 @@ impl NetStack {
         let socket = sockets.get_mut::<TcpSocket>(handle);
         tracing::debug!(
             ?handle,
-            local_ip = %self.local_ip(),
             local_port,
             remote = %addr,
             "connecting virtual TCP socket"
@@ -362,10 +372,10 @@ impl NetStack {
             let rx = UdpPacketBuffer::new(rx_meta, rx_data);
             let tx = UdpPacketBuffer::new(tx_meta, tx_data);
             let mut socket = UdpSocket::new(rx, tx);
-            match socket.bind((IpAddress::Ipv4(self.local_ip()), port)) {
+            match socket.bind(port) {
                 Ok(()) => {
                     let handle = inner.sockets.add(socket);
-                    tracing::debug!(?handle, local_ip = %self.local_ip(), local_port = port, "created virtual UDP socket");
+                    tracing::debug!(?handle, local_port = port, "created virtual UDP socket");
                     return Ok((handle, port));
                 }
                 Err(error) if local_port.is_some() => {
@@ -396,16 +406,11 @@ impl NetStack {
         addr: SocketAddr,
         data: &[u8],
     ) -> Result<usize> {
-        let remote = match addr {
-            SocketAddr::V4(v4) => v4,
-            SocketAddr::V6(_) => return Err(NetstackError::Ipv6NotSupported),
-        };
-
         let mut inner = self.inner.lock();
         inner
             .sockets
             .get_mut::<UdpSocket>(handle)
-            .send_slice(data, UdpMetadata::from(remote))
+            .send_slice(data, UdpMetadata::from(addr))
             .map_err(|error| NetstackError::UdpSend(error.to_string()))?;
         Ok(data.len())
     }
@@ -414,7 +419,7 @@ impl NetStack {
         &self,
         handle: SocketHandle,
         buffer: &mut [u8],
-    ) -> Result<(usize, SocketAddrV4)> {
+    ) -> Result<(usize, SocketAddr)> {
         let mut inner = self.inner.lock();
         let socket = inner.sockets.get_mut::<UdpSocket>(handle);
         let (payload, metadata) = socket
@@ -423,9 +428,7 @@ impl NetStack {
         let size = payload.len().min(buffer.len());
         buffer[..size].copy_from_slice(&payload[..size]);
         let endpoint = metadata.endpoint;
-        let address = match endpoint.addr {
-            IpAddress::Ipv4(ip) => SocketAddrV4::new(ip, endpoint.port),
-        };
+        let address = SocketAddr::new(endpoint.addr.into(), endpoint.port);
         Ok((size, address))
     }
 }
@@ -555,7 +558,7 @@ impl VirtualUdpSocket {
         }
     }
 
-    pub async fn recv_from(&self, buffer: &mut [u8]) -> Result<(usize, SocketAddrV4)> {
+    pub async fn recv_from(&self, buffer: &mut [u8]) -> Result<(usize, SocketAddr)> {
         loop {
             self.netstack.poll();
             if self.netstack.udp_can_recv(self.handle) {

@@ -13,7 +13,7 @@ gotatun = { path = "vendor/gotatun" }
 parking_lot = "0.12"
 rand = "0.8"
 rust-ini = { version = "0.21.3", features = ["inline-comment"] }
-smoltcp = { version = "0.12.0", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
+smoltcp = { version = "0.12.0", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 thiserror = "1.0"
 tokio = { version = "1.48.0", features = ["full"] }
 tracing = "0.1"
