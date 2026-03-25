@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  BINARY_NAME: wireproxy-rs
+
+permissions:
+  contents: read
+
+jobs:
+  build-musl:
+    name: Build ${{ matrix.label }} musl binary
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            artifact_dir: amd64
+            label: x86_64
+          - target: aarch64-unknown-linux-musl
+            artifact_dir: arm64
+            label: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install zig and cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: zig,cargo-zigbuild
+
+      - name: Build release binary
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist/${{ matrix.artifact_dir }}
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/${{ matrix.artifact_dir }}/${{ env.BINARY_NAME }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          path: dist/${{ matrix.artifact_dir }}/${{ env.BINARY_NAME }}
+          if-no-files-found: error
+
+  docker:
+    name: Build and push GHCR image
+    runs-on: ubuntu-latest
+    needs: build-musl
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-x86_64-unknown-linux-musl
+          path: dist/amd64
+
+      - name: Download arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-aarch64-unknown-linux-musl
+          path: dist/arm64
+
+      - name: Mark binaries executable
+        run: chmod +x dist/amd64/${{ env.BINARY_NAME }} dist/arm64/${{ env.BINARY_NAME }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
